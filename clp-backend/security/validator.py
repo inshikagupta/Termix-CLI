@@ -8,20 +8,6 @@ from __future__ import annotations
 
 import re
 
-from agent.state import AgentState
-
-
-def validate(state: AgentState) -> AgentState:
-    commands = list(state.get("commands") or [])
-    safe = validate_commands(commands)
-
-    state["valid"] = safe
-    # Keep compatibility with existing graph code that may read `validated`.
-    state["validated"] = safe
-
-    if not safe:
-        state["error"] = "Unsafe command detected"
-    return state
 
 
 _ALLOWLIST_PREFIXES = {

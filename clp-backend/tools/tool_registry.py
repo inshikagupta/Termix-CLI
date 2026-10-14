@@ -61,12 +61,60 @@ TOOL_REGISTRY: Dict[str, HandlerFn] = {
     "open_app_in_current_dir": lambda args: tool_open_app(args.get("app_name", ""), in_current_dir=True),
 
     # ── Native OS app shortcuts (no placeholder) ───────────────────────────
-    # These use the shell renderer (no handler needed) — they have no
-    # placeholders in their command templates.  Listed here as None to make
-    # the registry explicit about what is handled vs. what falls through.
     "app_open_terminal": None,        # type: ignore[assignment]
     "app_open_file_manager": None,    # type: ignore[assignment]
     "app_open_calculator": None,      # type: ignore[assignment]
     "fs_list_files": None,            # type: ignore[assignment]
     "fs_current_directory": None,     # type: ignore[assignment]
+
+    # ── Shell passthrough: cd intercepted by server.py _handle_cd() ────────
+    "fs_change_directory": None,      # type: ignore[assignment]
+
+    # ── Git shell passthroughs ─────────────────────────────────────────────
+    "git_status": None,               # type: ignore[assignment]
+    "git_add_all": None,              # type: ignore[assignment]
+    "git_commit": None,               # type: ignore[assignment]
+    "git_add_commit": None,           # type: ignore[assignment]
+    "git_branch_list": None,          # type: ignore[assignment]
+    "git_checkout_branch": None,      # type: ignore[assignment]
+    "git_branch_create": None,        # type: ignore[assignment]
+    "git_pull": None,                 # type: ignore[assignment]
+    "git_push": None,                 # type: ignore[assignment]
+    "git_diff": None,                 # type: ignore[assignment]
+    "git_log": None,                  # type: ignore[assignment]
+    "git_stash": None,                # type: ignore[assignment]
+    "git_stash_pop": None,            # type: ignore[assignment]
+    "git_init": None,                 # type: ignore[assignment]
+    "git_clone": None,                # type: ignore[assignment]
+    "git_reset_last": None,           # type: ignore[assignment]
+    "git_remote": None,               # type: ignore[assignment]
+
+    # ── Port / process shell passthroughs ──────────────────────────────────
+    "sys_show_processes": None,       # type: ignore[assignment]
+    "sys_kill_process": None,         # type: ignore[assignment]
+    "sys_ping_host": None,            # type: ignore[assignment]
+    "sys_kill_port": None,            # type: ignore[assignment]
+    "sys_check_port": None,           # type: ignore[assignment]
+    "sys_kill_by_name": None,         # type: ignore[assignment]
+    "sys_show_ports": None,           # type: ignore[assignment]
+
+    # ── npm shell passthroughs ─────────────────────────────────────────────
+    "npm_install": None,              # type: ignore[assignment]
+    "npm_install_package": None,      # type: ignore[assignment]
+    "npm_install_dev": None,          # type: ignore[assignment]
+    "npm_uninstall": None,            # type: ignore[assignment]
+    "npm_run_dev": None,              # type: ignore[assignment]
+    "npm_run_build": None,            # type: ignore[assignment]
+    "npm_run_script": None,           # type: ignore[assignment]
+    "npm_list": None,                 # type: ignore[assignment]
+
+    # ── Python / pip shell passthroughs ────────────────────────────────────
+    "python_create_venv": None,       # type: ignore[assignment]
+    "python_activate_venv": None,     # type: ignore[assignment]
+    "python_pip_install": None,       # type: ignore[assignment]
+    "python_run_file": None,          # type: ignore[assignment]
+    "pip_uninstall": None,            # type: ignore[assignment]
+    "pip_install_requirements": None, # type: ignore[assignment]
+    "pip_freeze": None,               # type: ignore[assignment]
+    "pip_list": None,                 # type: ignore[assignment]
 }

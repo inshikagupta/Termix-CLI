@@ -31,18 +31,14 @@ def _os_key() -> str:
 
 
 def _quote_value(value: str, os_key: str) -> str:
-    """
-    Safely quote a placeholder value for shell substitution.
-
-    - Strings containing spaces or special chars are double-quoted.
-    - Values that look like pure alphanumeric identifiers are kept bare.
-    - On Windows we use double quotes; on POSIX we use shlex.quote.
-    """
     if not value:
         return value
     # Already quoted
     if (value.startswith('"') and value.endswith('"')) or \
        (value.startswith("'") and value.endswith("'")):
+        return value
+    # Tilde paths: never quote, or shell won't expand ~
+    if value == "~" or value.startswith("~/"):
         return value
     # Safe bare value
     if re.match(r'^[\w./-]+$', value):

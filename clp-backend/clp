@@ -1,9 +1,0 @@
-#!/usr/bin/env bash
-# Convenient CLI wrapper for the AI Terminal Agent
-
-# Load environment variables from .env
-set -a
-source "$(dirname "$0")/.env"
-set +a
-
-python3 -m cli.main "$@"

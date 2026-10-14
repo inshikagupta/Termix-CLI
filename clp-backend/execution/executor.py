@@ -1,14 +1,13 @@
 """
-Execution stub.
+Execution module.
 
 Responsible for executing validated commands with timeout/sandbox configuration.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-from agent.state import AgentState
 from execution.shell import Shell
 
 try:
@@ -42,24 +41,35 @@ def _is_command_safe(command: str) -> bool:
     return True
 
 
-def execute_commands(commands: List[str] | str, dry_run: bool = False, verbose: bool = True) -> List[dict]:
+def execute_commands(
+    commands: List[str] | str,
+    dry_run: bool = False,
+    verbose: bool = True,
+    cwd: Optional[str] = None,
+) -> List[dict]:
     """
-    Execute commands sequentially with fail-fast behavior.
+    Execute commands sequentially with fail-fast behaviour.
 
-    Returns:
-    [
-      {
-        "command": str,
-        "success": bool,
-        "output": str,
-        "error": str
-      }
-    ]
+    Parameters
+    ----------
+    commands : list[str] | str
+        One or more shell commands to run in order.
+    dry_run : bool
+        If True, log but do not actually execute.
+    verbose : bool
+        Print progress to stdout.
+    cwd : str, optional
+        Working directory for all commands in this batch.
+        When supplied, commands run in this directory instead of the
+        server process's cwd — this is what makes `cd` persist across turns.
+
+    Returns
+    -------
+    list[dict]  Each dict has: command, success, output, error
     """
     shell = Shell(live_logging=False)
     results: List[dict] = []
 
-    # Compatibility: allow either a single command string or a list of commands.
     normalized_commands = [commands] if isinstance(commands, str) else list(commands)
 
     for raw_command in normalized_commands:
@@ -92,16 +102,14 @@ def execute_commands(commands: List[str] | str, dry_run: bool = False, verbose: 
                 print("[executor] DRY RUN: skipped execution")
             continue
 
-        shell_result = shell.run(command)
+        shell_result = shell.run(command, cwd=cwd)
         result = {
             "command": command,
             "success": bool(shell_result.get("success", False)),
             "output": str(shell_result.get("output", "")),
             "error": str(shell_result.get("error", "")),
         }
-        results.append(
-            result
-        )
+        results.append(result)
 
         if result["success"]:
             if verbose:
@@ -110,24 +118,5 @@ def execute_commands(commands: List[str] | str, dry_run: bool = False, verbose: 
             if verbose:
                 print("[executor] FAILED")
             break
-        # print(results)
+
     return results
-
-
-def execute(state: AgentState) -> AgentState:
-    raw_commands = state.get("commands")
-    if isinstance(raw_commands, str):
-        commands = [raw_commands]
-    else:
-        commands = list(raw_commands or [])
-    if not commands:
-        proposed = (state.get("proposed_command") or "").strip()
-        commands = [proposed] if proposed else []
-
-    if not commands:
-        state["execution_result"] = []
-        return state
-
-    state["execution_result"] = execute_commands(commands, dry_run=False, verbose=False)
-    return state
-

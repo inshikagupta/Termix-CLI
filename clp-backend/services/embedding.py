@@ -1,31 +1,32 @@
 """
-Unified embedding module.
+Unified embedding module using a real sentence embedding model.
 
 Provides a single ``get_embedding(text, task)`` entry point that:
   1. Tries the Gemini Embeddings API (if GEMINI_API_KEY is set).
-  2. Falls back to a local TF (term-frequency) vector built from the KB vocabulary.
+  2. Falls back to a local ONNX execution of sentence-transformers/all-MiniLM-L6-v2 (384-dim).
 
 Embeddings are used for:
   - **document**: building stored KB embeddings (via ``rebuild_embeddings``).
   - **query**: embedding user input at search time.
-
-Design notes:
-  - One module, one function signature — no second ``embedding_api`` module.
-  - TF fallback is deterministic and works offline (no API key needed).
-  - The vocabulary for TF is lazily built from ``knowledge_base.json`` and cached.
 """
 
 from __future__ import annotations
 
-import json
-import logging
 import os
-from functools import lru_cache
-from typing import List, Literal
+import logging
+from typing import List, Literal, Optional
+
+import numpy as np
+import onnxruntime as ort
+from huggingface_hub import hf_hub_download
+from transformers import AutoTokenizer
 
 logger = logging.getLogger(__name__)
 
 TaskKind = Literal["document", "query"]
+
+_ONNX_SESSION: Optional[ort.InferenceSession] = None
+_TOKENIZER: Optional[AutoTokenizer] = None
 
 
 # ---------------------------------------------------------------------------
@@ -59,17 +60,46 @@ def get_embedding(text: str, *, task: TaskKind = "document") -> List[float]:
         try:
             return _get_gemini_embedding(stripped, task=task, api_key=api_key)
         except Exception as exc:
-            logger.warning("Gemini embedding failed, falling back to TF: %s", exc)
+            logger.warning("Gemini embedding failed, falling back to local SBERT: %s", exc)
 
-    # Fallback: local TF vector (always works, no network needed)
-    return _get_tf_embedding(stripped)
+    # Fallback: local MiniLM-L6-v2 ONNX vector (works offline, no Net/API key required)
+    try:
+        return _get_local_embedding(stripped)
+    except Exception as exc:
+        logger.error("Local SBERT embedding failed: %s", exc)
+        return []
 
 
 # ---------------------------------------------------------------------------
 # Gemini embeddings
 # ---------------------------------------------------------------------------
 
-_EMBED_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "models/embedding-001")
+# "gemini-embedding-001" is the current production text embedding model.
+# (The old "models/embedding-001" / "embedding-gecko-001" models are legacy
+# PaLM-era models being phased out; "gemini-embedding-gecko-001" and
+# "gemini-embedding-tiger-001" were never real model names, which is why
+# calls were 404ing.)
+_EMBED_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001")
+
+_GENAI_CLIENT = None
+
+
+_GEMINI_TIMEOUT_MS = int(os.getenv("GEMINI_EMBEDDING_TIMEOUT_MS", "5000"))
+
+
+def _get_genai_client():
+    """Lazily construct and cache the google-genai client."""
+    global _GENAI_CLIENT
+    if _GENAI_CLIENT is None:
+        from google import genai
+        from google.genai.types import HttpOptions
+        # http_options timeout ensures a slow/unresponsive API can't hang
+        # the request indefinitely - without this, a network stall here
+        # blocks the whole HTTP request with no fallback ever triggering.
+        _GENAI_CLIENT = genai.Client(
+            http_options=HttpOptions(timeout=_GEMINI_TIMEOUT_MS)
+        )
+    return _GENAI_CLIENT
 
 
 def _get_gemini_embedding(
@@ -78,101 +108,84 @@ def _get_gemini_embedding(
     task: TaskKind,
     api_key: str,
 ) -> List[float]:
-    """Call the Gemini Embeddings API."""
-    import google.generativeai as genai
+    """Call the Gemini Embeddings API via the current google-genai SDK.
 
-    genai.configure(api_key=api_key)
+    Note: gemini-embedding-001 only accepts a single input string per
+    request (unlike the older embedding-001 model, which allowed batches),
+    so this function embeds one text at a time.
+    """
+    from google.genai.types import EmbedContentConfig
 
-    task_type = "retrieval_document" if task == "document" else "retrieval_query"
+    client = _get_genai_client()
 
-    result = genai.embed_content(
+    task_type = "RETRIEVAL_DOCUMENT" if task == "document" else "RETRIEVAL_QUERY"
+
+    result = client.models.embed_content(
         model=_EMBED_MODEL,
-        content=text,
-        task_type=task_type,
+        contents=text,
+        config=EmbedContentConfig(task_type=task_type),
     )
-    emb = result.get("embedding")
-    if isinstance(emb, list) and emb:
-        logger.debug("Gemini embedding: %d dimensions", len(emb))
-        return [float(x) for x in emb]
+
+    embeddings = getattr(result, "embeddings", None)
+    if embeddings:
+        values = embeddings[0].values
+        if values:
+            logger.debug("Gemini embedding: %d dimensions", len(values))
+            return [float(x) for x in values]
 
     raise ValueError("Gemini returned empty embedding")
 
 
 # ---------------------------------------------------------------------------
-# TF (term-frequency) fallback
+# Local SBERT ONNX embeddings
 # ---------------------------------------------------------------------------
 
-def _get_tf_embedding(text: str) -> List[float]:
+def _get_local_embedding(text: str) -> List[float]:
     """
-    Build a simple term-frequency vector using the KB vocabulary.
-
-    Each dimension corresponds to a word in the KB.  The value is
-    ``count(word) / total_words`` in the input text.  This gives a
-    sparse but deterministic embedding that works for cosine similarity
-    without any external API.
+    Generate a 384-dimensional dense sentence embedding locally
+    using Xenova/all-MiniLM-L6-v2 via ONNX runtime and CPU execution.
     """
-    words = text.lower().split()
-    vocab = _get_vocab()
-    embedding = [0.0] * len(vocab)
+    global _ONNX_SESSION, _TOKENIZER
+    if _ONNX_SESSION is None or _TOKENIZER is None:
+        # Suppress ONNX runtime logging warnings
+        os.environ["ORT_LOGGING_LEVEL"] = "3"
+        sess_options = ort.SessionOptions()
+        sess_options.log_severity_level = 3
 
-    word_count = len(words)
-    if word_count == 0:
-        return embedding
+        # Download ONNX model file and tokenizer
+        model_path = hf_hub_download(repo_id="Xenova/all-MiniLM-L6-v2", filename="onnx/model.onnx")
 
-    for word in words:
-        clean_word = "".join(c for c in word if c.isalnum() or c == "_")
-        if clean_word in vocab:
-            idx = vocab[clean_word]
-            embedding[idx] += 1.0 / word_count
+        _ONNX_SESSION = ort.InferenceSession(model_path, sess_options)
+        _TOKENIZER = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
 
-    logger.debug("TF embedding: %d dimensions", len(embedding))
-    return embedding
+    # Tokenize input text
+    encoded = _TOKENIZER(text, padding=True, truncation=True, return_tensors="np")
+    inputs = {
+        name: encoded[name].astype(np.int64)
+        for name in ["input_ids", "attention_mask", "token_type_ids"]
+        if name in encoded
+    }
 
+    # Run inference
+    outputs = _ONNX_SESSION.run(None, inputs)
+    last_hidden_state = outputs[0]
+    attention_mask = encoded["attention_mask"]
 
-@lru_cache(maxsize=1)
-def _get_vocab() -> dict:
-    """
-    Build a sorted vocabulary from all text fields in the KB.
+    # Mean Pooling
+    input_mask_expanded = np.expand_dims(attention_mask, axis=-1)
+    input_mask_expanded = np.broadcast_to(input_mask_expanded, last_hidden_state.shape).astype(float)
+    sum_embeddings = np.sum(last_hidden_state * input_mask_expanded, axis=1)
+    sum_mask = np.clip(np.sum(input_mask_expanded, axis=1), a_min=1e-9, a_max=None)
+    mean_embeddings = sum_embeddings / sum_mask
 
-    Cached so we only read the file once per process.
-    """
-    vocab: dict = {}
-    kb_path = os.path.join(
-        os.path.dirname(__file__), "..", "knowledge", "knowledge_base.json"
-    )
+    # L2 Normalization
+    norm = np.linalg.norm(mean_embeddings, ord=2, axis=1, keepdims=True)
+    norm = np.clip(norm, a_min=1e-9, a_max=None)
+    normalized_embeddings = mean_embeddings / norm
 
-    try:
-        with open(kb_path, "r", encoding="utf-8") as f:
-            kb = json.load(f)
-
-        word_set: set = set()
-        for rule in kb.get("rules", []):
-            texts = [
-                rule.get("intent", ""),
-                rule.get("description", ""),
-            ]
-            texts.extend(rule.get("examples", []))
-            text_field = rule.get("text", "")
-            if text_field:
-                texts.append(text_field)
-
-            for t in texts:
-                if t:
-                    for w in str(t).lower().split():
-                        clean = "".join(c for c in w if c.isalnum() or c == "_")
-                        if clean:
-                            word_set.add(clean)
-
-        for idx, word in enumerate(sorted(word_set)):
-            vocab[word] = idx
-
-        logger.info("Built TF vocabulary: %d unique words", len(vocab))
-    except Exception as exc:
-        logger.error("Failed to build vocabulary: %s", exc)
-
-    return vocab
+    return normalized_embeddings[0].tolist()
 
 
 def clear_embedding_cache() -> None:
-    """Clear the cached TF vocabulary (e.g. after KB update)."""
-    _get_vocab.cache_clear()
+    """No-op for SBERT cache compatibility."""
+    pass

@@ -27,9 +27,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # Semantic threshold for search.
-# TF embeddings are sparse, so 0.60 is a reasonable cutoff.
-# Gemini embeddings are denser — this threshold works for both.
-SEMANTIC_THRESHOLD = 0.60
+# Lowered to 0.45 for dense SBERT embeddings.
+SEMANTIC_THRESHOLD = 0.45
 
 _auto_rebuild_done = False
 

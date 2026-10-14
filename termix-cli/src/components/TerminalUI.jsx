@@ -1,11 +1,15 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import OutputLine from './OutputLine.jsx';
+import { processCommand } from '../commands.js';
 import {
   resolveQuery,
   executeCommands,
+  executeStream,
   sendInteractiveInput,
   getInteractiveStatus,
   checkHealth,
+  getDefaultCwd,
+  explainError,
 } from '../services/api.js';
 
 function appendLines(setOutput, type, lines) {
@@ -13,8 +17,18 @@ function appendLines(setOutput, type, lines) {
   setOutput((prev) => [...prev, { type, lines, id }]);
 }
 
+/** Abbreviate a full path for the prompt: /Users/shubham/Desktop → ~/Desktop */
+function shortenPath(fullPath) {
+  if (!fullPath) return '~';
+  const home = fullPath.match(/^\/Users\/[^/]+/) || fullPath.match(/^\/home\/[^/]+/);
+  if (home) {
+    return fullPath.replace(home[0], '~');
+  }
+  return fullPath;
+}
+
 const BOOT_LINES = [
-  { type: 'system', lines: ['TermiX Shell v1.0.0  —  Electron + React + Vite'] },
+  { type: 'system', lines: ['TermiX Shell v2.0.0  —  Electron + React + Vite'] },
   { type: 'system', lines: ['Copyright (c) 2025 TermiX. All rights reserved.'] },
   { type: 'system', lines: [''] },
   { type: 'system', lines: ['Initializing runtime...          [OK]'] },
@@ -28,6 +42,11 @@ export default function TerminalUI({ visible }) {
   const [historyIndex, setHistoryIndex] = useState(-1);
   const [isProcessing, setIsProcessing] = useState(false);
   const [showContent, setShowContent] = useState(false);
+  const [cwd, setCwd] = useState('~');                    // current working directory
+  const [isStreaming, setIsStreaming] = useState(false);  // live output running
+  const [isExplaining, setIsExplaining] = useState(false); // /explain call in flight
+  const streamCancelRef = useRef(null);                   // cancel fn for active stream
+
   /** @type {'idle' | 'confirm' | 'running'} */
   const [flowStep, setFlowStep] = useState('idle');
   const [flowSessionId, setFlowSessionId] = useState(null);
@@ -47,7 +66,7 @@ export default function TerminalUI({ visible }) {
   const bottomRef = useRef(null);
   const containerRef = useRef(null);
 
-  // Animate boot lines + health check
+  // Animate boot lines + health check + fetch initial cwd
   useEffect(() => {
     if (!visible) return;
     const timer = setTimeout(() => setShowContent(true), 100);
@@ -58,11 +77,15 @@ export default function TerminalUI({ visible }) {
         i++;
       } else {
         clearInterval(interval);
-        // Check backend health
         checkHealth()
-          .then(() => {
+          .then(async () => {
             appendLines(setOutput, 'success', ['Connecting to backend...         [OK]']);
             appendLines(setOutput, 'system', ['']);
+            // Fetch the real starting cwd from the backend
+            try {
+              const initialCwd = await getDefaultCwd();
+              if (initialCwd) setCwd(initialCwd);
+            } catch (_) { /* non-fatal */ }
             appendLines(setOutput, 'info', ['Enter commands or natural language queries to execute. help / clear']);
             appendLines(setOutput, 'system', ['']);
           })
@@ -93,7 +116,7 @@ export default function TerminalUI({ visible }) {
     setHistoryIndex(-1);
     if (!trimmed) return;
 
-    const cmdEntry = { type: 'command', text: trimmed, id: Date.now() };
+    const cmdEntry = { type: 'command', text: trimmed, prompt: shortenPath(cwd), id: Date.now() };
     setOutput((prev) => [...prev, cmdEntry]);
 
     if (flowStep === 'idle' && trimmed.toLowerCase() !== 'clear' && trimmed.toLowerCase() !== 'help') {
@@ -102,6 +125,7 @@ export default function TerminalUI({ visible }) {
 
     setIsProcessing(true);
 
+    // ── Built-in UI commands ────────────────────────────────────────────────
     if (trimmed.toLowerCase() === 'clear') {
       setTimeout(() => setOutput([]), 100);
       resetInteractiveFlow();
@@ -109,27 +133,25 @@ export default function TerminalUI({ visible }) {
       return;
     }
 
-    if (trimmed.toLowerCase() === 'help') {
-      appendLines(setOutput, 'info', [
-        '╔══════════════════════════════════════════════════╗',
-        '║           TermiX CLI — Command Reference         ║',
-        '╚══════════════════════════════════════════════════╝',
-        '',
-        '  <query>      — Natural language or direct commands',
-        '                 Automatically resolves via AI agent',
-        '                 and executes (no confirmation needed).',
-        '',
-        '  clear        — Clear terminal screen and reset flow',
-        '  help         — Show this help message',
-        '',
-        '  TIP: Use ↑↓ arrow keys to navigate command history',
-      ]);
-      setIsProcessing(false);
-      return;
+    // ── Check built-in commands first (theme, version, uptime, etc.) ────────
+    // Only in idle mode — not when waiting for y/n confirmation
+    if (flowStep === 'idle') {
+      try {
+        const builtinResult = await processCommand(trimmed, cmdHistory);
+        if (builtinResult !== null) {
+          if (builtinResult.type === 'clear') {
+            setTimeout(() => setOutput([]), 100);
+          } else {
+            appendLines(setOutput, builtinResult.type, builtinResult.lines || []);
+          }
+          setIsProcessing(false);
+          return;
+        }
+      } catch (_) { /* fall through to backend */ }
     }
 
     try {
-      // ── Confirmation step ──────────────────────────────
+      // ── Confirmation step ──────────────────────────────────────────────────
       if (flowStep === 'confirm') {
         const t = trimmed.toLowerCase();
         if (t === 'no' || t === 'n') {
@@ -142,46 +164,50 @@ export default function TerminalUI({ visible }) {
           return;
         }
 
-        // User confirmed — execute commands
         const sid = flowSessionId;
         const cmds = flowCommands;
         const src = flowSource;
 
-        const exec = await executeCommands(sid, cmds, src);
-
-        // Show executor log lines (like the CLI screenshot)
-        if (exec.line) {
-          const logLines = exec.line.split('\n');
-          appendLines(setOutput, 'system', logLines);
-        }
-
-        // Show detailed results (like `$ command  (exit 0)` and output)
-        const results = exec.results || [];
-        for (const item of results) {
-          const exitCode = item.success ? 0 : 1;
-          const header = `$ ${item.command}  (exit ${exitCode})`;
-          const lines = [header];
-
-          if (item.output && item.output.trim()) {
-            lines.push(...item.output.trimEnd().split('\n'));
-          }
-          if (item.error && item.error.trim()) {
-            lines.push(...item.error.trimEnd().split('\n'));
-          }
-
-          appendLines(setOutput, item.success ? 'success' : 'error', lines);
-        }
-
+        // Use streaming for confirmed commands
+        setIsStreaming(true);
         resetInteractiveFlow();
+
+        const liveLineId = Date.now() + Math.random();
+        setOutput(prev => [...prev, { type: 'system', lines: [], id: liveLineId, streaming: true }]);
+
+        const cancel = executeStream(sid, cmds, src, cwd, {
+          onLine: (line) => {
+            setOutput(prev => prev.map(entry =>
+              entry.id === liveLineId
+                ? { ...entry, lines: [...entry.lines, line] }
+                : entry
+            ));
+          },
+          onDone: ({ cwd: newCwd, success, cdOnly }) => {
+            setIsStreaming(false);
+            streamCancelRef.current = null;
+            if (newCwd) setCwd(newCwd);
+            // Seal the streaming block
+            setOutput(prev => prev.map(entry =>
+              entry.id === liveLineId
+                ? { ...entry, streaming: false, type: success ? 'success' : 'error' }
+                : entry
+            ));
+          },
+          onError: (msg) => {
+            setIsStreaming(false);
+            streamCancelRef.current = null;
+            appendLines(setOutput, 'error', [`Error: ${msg}`]);
+          },
+        });
+        streamCancelRef.current = cancel;
         return;
       }
 
-      // ── Running step (interactive input) ──────────────
+      // ── Running step (interactive stdin) ──────────────────────────────────
       if (flowStep === 'running') {
         if (/^ask\s/i.test(trimmed)) {
-          appendLines(setOutput, 'error', [
-            'Cannot start a new ask while a process is running. Respond to the CLI, or use clear.',
-          ]);
+          appendLines(setOutput, 'error', ['Cannot start a new ask while a process is running.']);
           return;
         }
         const sid = flowSessionId;
@@ -189,7 +215,6 @@ export default function TerminalUI({ visible }) {
         if (res.line != null && res.line !== '') {
           appendLines(setOutput, 'system', [res.line]);
         }
-
         const st = await getInteractiveStatus(sid);
         if (st.status === 'completed') {
           appendLines(setOutput, 'success', ['Command completed.']);
@@ -198,74 +223,119 @@ export default function TerminalUI({ visible }) {
         return;
       }
 
-      // ── New "ask" command ─────────────────────────────
+      // ── New query / command ──────────────────────────────────────────────
       const query = trimmed;
-      if (!query) {
-        appendLines(setOutput, 'error', ['Empty query.']);
-        return;
-      }
-
       resetInteractiveFlow();
       const sid = crypto.randomUUID();
       setFlowSessionId(sid);
 
-      // Call /resolve with session_id
-      const r = await resolveQuery(query, sid);
+      const r = await resolveQuery(query, sid, cwd);
 
-      // Handle error state
+      // Update cwd from resolve response (in case pipeline changed it)
+      if (r.cwd) setCwd(r.cwd);
+
       if (r.error) {
         appendLines(setOutput, 'error', [`Blocked: ${r.error}`]);
         resetInteractiveFlow();
         return;
       }
 
-      // Handle missing placeholders — prompt user for more input
       if (r.missing_placeholders && r.missing_placeholders.length > 0) {
-        const placeholderLines = [
+        appendLines(setOutput, 'info', [
           'Need more information:',
           ...r.missing_placeholders.map(p => `  • ${p}`),
           '',
           'Please provide the missing value(s):',
-        ];
-        appendLines(setOutput, 'info', placeholderLines);
-        setFlowStep('idle');  // Back to idle for user input
+        ]);
+        setFlowStep('idle');
         return;
       }
 
-      // Handle tool_output — Python-native tool executed successfully
+      // Python-native tool already executed
       if (r.tool_output && r.tool_output.trim()) {
-        const lines = [
+        appendLines(setOutput, 'success', [
           `[Source: ${r.source_display}]`,
           r.tool_output.trimEnd(),
-        ];
-        appendLines(setOutput, 'success', lines);
+        ]);
         resetInteractiveFlow();
         return;
       }
 
-      // Handle commands — show confirmation
+      // Commands — stream them immediately without asking for confirmation
+      // UNLESS requires_confirmation is set (for destructive ops)
       if (r.commands && r.commands.length > 0) {
-        // Store flow state
-        setFlowCommands(r.commands);
-        setFlowSource(r.source);
-        setFlowSourceDisplay(r.source_display);
-        setFlowStep('confirm');
+        if (r.requires_confirmation) {
+          // Show confirmation prompt for destructive operations
+          setFlowCommands(r.commands);
+          setFlowSource(r.source);
+          setFlowSourceDisplay(r.source_display);
+          setFlowStep('confirm');
 
-        // ── Display generated commands with confirmation ──
-        const outputLines = ['Generated commands:'];
-        r.commands.forEach((cmd, i) => {
-          outputLines.push(`  ${i + 1}. ${cmd}`);
+          const outputLines = ['⚠ This operation requires confirmation:'];
+          r.commands.forEach((cmd, i) => {
+            outputLines.push(`  ${i + 1}. ${cmd}`);
+          });
+          outputLines.push('');
+          outputLines.push(`[Source: ${r.source_display}]`);
+          outputLines.push('');
+          outputLines.push('Execute these command(s)? [y/N]:');
+          appendLines(setOutput, 'warn', outputLines);
+          return;
+        }
+
+        // Auto-execute non-destructive commands with streaming
+        setIsStreaming(true);
+        const liveLineId = Date.now() + Math.random();
+        setOutput(prev => [...prev, { type: 'system', lines: [`[Source: ${r.source_display}]`], id: liveLineId, streaming: true }]);
+
+        const cancel = executeStream(sid, r.commands, r.source, cwd, {
+          onLine: (line) => {
+            setOutput(prev => prev.map(entry =>
+              entry.id === liveLineId
+                ? { ...entry, lines: [...entry.lines, line] }
+                : entry
+            ));
+          },
+          onDone: ({ cwd: newCwd, success }) => {
+            setIsStreaming(false);
+            streamCancelRef.current = null;
+            if (newCwd) setCwd(newCwd);
+            setOutput(prev => prev.map(entry =>
+              entry.id === liveLineId
+                ? { ...entry, streaming: false, type: success ? 'success' : 'error' }
+                : entry
+            ));
+            if (!success) {
+              // Offer error explanation
+              const capturedLines = [];
+              setOutput(prev => {
+                const block = prev.find(e => e.id === liveLineId);
+                if (block) capturedLines.push(...(block.lines || []));
+                return [
+                  ...prev,
+                  {
+                    type: 'explain_prompt',
+                    command: r.commands.join(' && '),
+                    outputText: capturedLines.join('\n'),
+                    cwd,
+                    id: Date.now() + Math.random(),
+                  },
+                ];
+              });
+            }
+            resetInteractiveFlow();
+          },
+          onError: (msg) => {
+            setIsStreaming(false);
+            streamCancelRef.current = null;
+            appendLines(setOutput, 'error', [`Error: ${msg}`]);
+            resetInteractiveFlow();
+          },
         });
-        outputLines.push('');
-        outputLines.push(`[Source: ${r.source_display}]`);
-        outputLines.push('');
-        outputLines.push("Execute these command(s)? [y/N]:");
-
-        appendLines(setOutput, 'info', outputLines);
+        streamCancelRef.current = cancel;
         return;
       }
 
-      // No commands, no output, no missing placeholders, no error
       appendLines(setOutput, 'error', ['No commands generated.']);
       resetInteractiveFlow();
 
@@ -275,7 +345,45 @@ export default function TerminalUI({ visible }) {
     } finally {
       setIsProcessing(false);
     }
-  }, [input, flowStep, flowSessionId, flowCommands, flowSource, flowSourceDisplay, resetInteractiveFlow]);
+  }, [input, flowStep, flowSessionId, flowCommands, flowSource, flowSourceDisplay, cwd, resetInteractiveFlow]);
+
+  const handleExplain = useCallback(async (entry) => {
+    setIsExplaining(true);
+    // Replace the explain_prompt with a loading indicator
+    setOutput(prev => prev.map(e =>
+      e.id === entry.id ? { ...e, loading: true } : e
+    ));
+    try {
+      const result = await explainError(entry.command, entry.outputText, '', entry.cwd);
+      setOutput(prev => prev.map(e =>
+        e.id === entry.id
+          ? {
+              ...e,
+              loading: false,
+              type: 'explanation',
+              lines: [
+                '╔══ 🤖 AI Diagnosis ═══════════════════════════════════╗',
+                ...(result.explanation || 'No explanation available.').split('\n').map(l => `  ${l}`),
+                ...(result.suggested_fix ? [
+                  '',
+                  '  ✦ Suggested fix:',
+                  `  ${result.suggested_fix}`,
+                ] : []),
+                '╚══════════════════════════════════════════════════════╝',
+              ],
+            }
+          : e
+      ));
+    } catch (err) {
+      setOutput(prev => prev.map(e =>
+        e.id === entry.id
+          ? { ...e, loading: false, type: 'error', lines: [`Failed to get explanation: ${err.message}`] }
+          : e
+      ));
+    } finally {
+      setIsExplaining(false);
+    }
+  }, []);
 
   const handleKeyDown = (e) => {
     if (e.key === 'Enter') {
@@ -292,6 +400,12 @@ export default function TerminalUI({ visible }) {
       setHistoryIndex(newIdx);
       setInput(newIdx === -1 ? '' : cmdHistory[newIdx]);
     } else if (e.key === 'c' && e.ctrlKey) {
+      // Cancel active stream
+      if (streamCancelRef.current) {
+        streamCancelRef.current();
+        streamCancelRef.current = null;
+        setIsStreaming(false);
+      }
       setInput('');
       resetInteractiveFlow();
       setOutput((prev) => [...prev, { type: 'system', lines: ['^C'], id: Date.now() }]);
@@ -303,6 +417,18 @@ export default function TerminalUI({ visible }) {
   };
 
   if (!visible) return null;
+
+  const shortCwd = shortenPath(cwd);
+  const promptText =
+    flowStep === 'confirm' ? '[y/N]>' :
+    flowStep === 'running' ? 'stdin>' :
+    `${shortCwd}$`;
+
+  const statusLabel =
+    isStreaming ? '▶ RUNNING' :
+    isProcessing ? '⟳ PROCESSING' :
+    flowStep === 'confirm' ? '? CONFIRM' :
+    '● READY';
 
   return (
     <div
@@ -333,26 +459,17 @@ export default function TerminalUI({ visible }) {
         WebkitAppRegion: 'drag',
         gap: 8,
       }}>
-        {/* Title */}
         <div style={{
           flex: 1, textAlign: 'center',
           fontSize: 12, color: 'rgba(0,255,156,0.4)',
           letterSpacing: 3, textTransform: 'uppercase',
           fontFamily: 'var(--font-mono)',
         }}>
-          TermiX CLI — dev@termix:~
+          TermiX CLI — {shortCwd}
         </div>
-
-        {/* Right badges */}
         <div style={{ display: 'flex', gap: 12, alignItems: 'center', WebkitAppRegion: 'no-drag' }}>
           <span style={{ fontSize: 10, color: 'rgba(0,255,156,0.3)', letterSpacing: 1 }}>
-            {isProcessing
-              ? '⟳ PROCESSING'
-              : flowStep === 'confirm'
-                ? '? CONFIRM'
-                : flowStep === 'running'
-                  ? '▶ RUNNING'
-                  : '● READY'}
+            {statusLabel}
           </span>
         </div>
       </div>
@@ -401,12 +518,75 @@ export default function TerminalUI({ visible }) {
           lineHeight: 1.6,
         }}
       >
-        {output.map((entry, i) => (
-          <OutputLine key={entry.id || i} entry={entry} index={i} />
-        ))}
+        {output.map((entry, i) => {
+          // ── Explain prompt: inline button after a failed command ──
+          if (entry.type === 'explain_prompt') {
+            return (
+              <div key={entry.id || i} style={{ marginBottom: 8, paddingLeft: 4 }}>
+                {entry.loading ? (
+                  <span style={{ color: 'rgba(0,255,156,0.5)', fontSize: 12, fontFamily: 'var(--font-mono)' }}>
+                    🤖 Diagnosing error...
+                  </span>
+                ) : (
+                  <button
+                    onClick={() => handleExplain(entry)}
+                    disabled={isExplaining}
+                    style={{
+                      background: 'transparent',
+                      border: '1px solid rgba(0,255,156,0.25)',
+                      borderRadius: 4,
+                      color: 'rgba(0,255,156,0.6)',
+                      fontFamily: 'var(--font-mono)',
+                      fontSize: 11,
+                      padding: '3px 10px',
+                      cursor: isExplaining ? 'default' : 'pointer',
+                      letterSpacing: '0.05em',
+                      transition: 'all 0.2s',
+                    }}
+                    onMouseEnter={e => { e.target.style.borderColor = 'rgba(0,255,156,0.6)'; e.target.style.color = 'var(--green)'; }}
+                    onMouseLeave={e => { e.target.style.borderColor = 'rgba(0,255,156,0.25)'; e.target.style.color = 'rgba(0,255,156,0.6)'; }}
+                  >
+                    🤖 Why did this fail? →
+                  </button>
+                )}
+              </div>
+            );
+          }
+
+          // ── Explanation block ─────────────────────────────────────
+          if (entry.type === 'explanation') {
+            return (
+              <div key={entry.id || i} style={{ marginBottom: 10 }}>
+                {(entry.lines || []).map((line, li) => (
+                  <div key={li} style={{
+                    color: line.includes('✦') ? 'var(--amber)' : 'rgba(0,255,156,0.7)',
+                    paddingLeft: 4, lineHeight: '1.7',
+                    whiteSpace: 'pre-wrap', fontFamily: 'var(--font-mono)', fontSize: 13,
+                  }}>
+                    {line || '\u00A0'}
+                  </div>
+                ))}
+              </div>
+            );
+          }
+
+          return <OutputLine key={entry.id || i} entry={entry} index={i} />;
+        })}
+
+        {/* Streaming indicator */}
+        {isStreaming && (
+          <div style={{
+            color: 'rgba(0,255,156,0.5)',
+            fontSize: 12,
+            paddingLeft: 4,
+            animation: 'blink 0.8s step-end infinite',
+          }}>
+            ▶ streaming output... (Ctrl+C to cancel)
+          </div>
+        )}
 
         {/* Processing indicator */}
-        {isProcessing && (
+        {isProcessing && !isStreaming && (
           <div style={{
             color: 'rgba(0,255,156,0.5)',
             fontSize: 12,
@@ -427,18 +607,19 @@ export default function TerminalUI({ visible }) {
         background: 'var(--bg-secondary)',
         flexShrink: 0,
       }}>
-        <div style={{
-          display: 'flex', alignItems: 'center', gap: 10,
-        }}>
-          {/* Prompt */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          {/* Prompt — shows real path */}
           <span style={{
-            color: flowStep === 'confirm' ? 'var(--amber)' : 'rgba(0,255,156,0.6)',
+            color: flowStep === 'confirm' ? 'var(--amber)' :
+                   isStreaming ? 'rgba(0,255,156,0.3)' :
+                   'rgba(0,255,156,0.6)',
             fontSize: 13,
             fontFamily: 'var(--font-mono)',
             flexShrink: 0,
             userSelect: 'none',
+            whiteSpace: 'nowrap',
           }}>
-            {flowStep === 'confirm' ? '[y/N]>' : flowStep === 'running' ? 'cli>' : 'dev@termix:~$'}
+            {promptText}
           </span>
 
           {/* Input */}
@@ -447,7 +628,7 @@ export default function TerminalUI({ visible }) {
             value={input}
             onChange={e => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
-            disabled={isProcessing}
+            disabled={isProcessing && !isStreaming}
             autoComplete="off"
             autoCorrect="off"
             autoCapitalize="off"

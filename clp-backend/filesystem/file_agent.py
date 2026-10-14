@@ -14,22 +14,51 @@ utils/file_ops.py keeps only parsing helpers (extract_filename, etc.).
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from tools.types import ToolResult
 from utils.os_detector import detect_os
 
 
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def _safe_path(raw: str) -> Path:
-    """Resolve path relative to cwd — refuse absolute escapes."""
-    p = Path(raw)
-    # For safety: reject paths that navigate above cwd
-    resolved = (Path.cwd() / p).resolve()
+def _safe_path(raw: str, base_dir: Optional[str] = None) -> Path:
+    """
+    Resolve a user-supplied path safely.
+
+    Rules:
+    - Absolute paths  (/Users/shubham/Desktop/file.txt)  → used as-is
+    - Home-relative   (~/Desktop/file.txt)                → expanded via expanduser()
+    - Bare relative   (notes.txt, myfolder/sub)           → anchored to base_dir (session cwd)
+                                                            or server cwd if base_dir is None
+
+    Traversal guard: blocks paths that try to escape via ../../ tricks on relative paths.
+    """
+    p = Path(raw.strip())
+
+    # Absolute path — use directly
+    if p.is_absolute():
+        return p.resolve()
+
+    # Home-relative path (~/...)
+    if raw.strip().startswith("~"):
+        return p.expanduser().resolve()
+
+    # Bare relative path — anchor to session cwd (or server cwd as fallback)
+    anchor = Path(os.path.expanduser(base_dir)) if base_dir else Path.cwd()
+    resolved = (anchor / p).resolve()
+    try:
+        resolved.relative_to(anchor.resolve())
+    except ValueError:
+        raise ValueError(
+            f"Path '{raw}' escapes the working directory. "
+            "Use an absolute path (e.g. ~/Desktop/file.txt) instead."
+        )
     return resolved
 
 
